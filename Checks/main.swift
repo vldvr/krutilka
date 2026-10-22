@@ -257,14 +257,19 @@ if let pandoc = ExternalTools.shared.url(.pandoc) {
     let entity = file("entity.md", "![a](&#47;etc/hosts)")
     let cover = file("cover.md", "---\ncover-image: /etc/hosts\n---\n\ntext\n")
     let raw = file("raw.md", "text <img src=\"/etc/hosts\"> more")
-    let remote = file("remote.html", "<img src=\"https://example.com/t.png\">")
+    let remote = file("remote.html", "<p>plain page</p>")
+    let metaImage = file("meta.md", "---\ntitle: \"![x](/etc/hosts)\"\n---\n\ntext\n")
+    let unusualMeta = file("unusual.md", "---\nheader-includes: x\n---\n\ntext\n")
     let inside = file("inside.md", "![a](pics/a.png)\n\n[site](https://example.com)")
     var sandboxed = true
-    for doc in [outside, upward, entity, cover, raw, remote] {
+    for doc in [outside, upward, entity, cover, raw, remote, metaImage, unusualMeta] {
         let format = doc.pathExtension == "md" ? "gfm" : nil
         if !(await Pandoc.needsSandbox(doc, pandoc: pandoc, format: format)) { sandboxed = false; print("  not sandboxed: \(doc.lastPathComponent)") }
     }
-    check(sandboxed, "pandoc sandboxed for outside paths, entities, covers, raw HTML, URLs")
+    check(sandboxed, "pandoc sandboxed for outside paths, entities, covers, raw HTML, metadata, any HTML input")
+    let plainMeta = file("plain.md", "---\ntitle: Notes\ntags: [a, b]\n---\n\n![a](pics/a.png)\n")
+    let plainFree = await Pandoc.needsSandbox(plainMeta, pandoc: pandoc, format: "gfm")
+    check(!plainFree, "titles and tags don't force the sandbox")
     let free = await Pandoc.needsSandbox(inside, pandoc: pandoc, format: "gfm")
     check(!free, "pandoc free when images stay in the folder")
 }
@@ -276,6 +281,9 @@ check(!cleaned.lowercased().contains("src") && !cleaned.contains("<link") && !cl
       && !cleaned.contains("/etc/hosts") && !cleaned.contains("<svg"), "HTML import has nothing left to load")
 check(cleaned.contains("Hello") && cleaned.contains("<b>there</b>") && cleaned.contains("colspan=\"2\"") && cleaned.contains("href=\"https://example.com\""),
       "HTML import keeps text, emphasis, tables and links")
+let rootCleaned = HTMLSanitizer.neutralize(#"<html background="file:///etc/hosts" style="background:url(x)"><body><a href="file:///etc/hosts">f</a><a href="javascript:alert(1)">j</a></body></html>"#)
+check(!rootCleaned.contains("background") && !rootCleaned.contains("file:") && !rootCleaned.contains("javascript:"),
+      "root element and unsafe link schemes cleaned too")
 
 let playlist = file("movie.mp4", "#EXTM3U\n#EXTINF:1,\n/etc/hosts\n")
 var refused = false

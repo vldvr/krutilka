@@ -365,21 +365,24 @@ enum Pandoc {
         try await Shell.run(pandoc, (locked ? ["--sandbox"] : []) + args, cwd: input.deletingLastPathComponent())
     }
 
-    /// Metadata pandoc may turn into a file read: covers, styles, fonts, bibliographies, includes.
-    private static let riskyMeta = ["image", "cover", "css", "font", "include", "bib", "csl", "abbreviation",
-                                    "reference", "template", "logo", "icon", "header"]
+    /// Metadata fields that only carry words. Any other field (cover-image, css, bibliography,
+    /// header-includes…) can make a writer read a file, so it means the sandbox.
+    private static let plainMeta: Set<String> = ["title", "subtitle", "author", "date", "lang", "keywords", "tags",
+                                                 "description", "aliases", "created", "updated", "modified",
+                                                 "category", "categories", "summary"]
     /// Raw HTML is passed through untouched, and the EPUB writer may still fetch what it names.
     private static let riskyRaw = ["src", "href", "url", "style", "import", "&#", "data", "xlink", "background",
                                    "poster", "<link", "<object", "<embed", "<iframe", "<svg", "<base"]
 
     /// Containers (DOCX, EPUB, ODT) carry their own media, so for them the sandbox costs nothing.
+    /// HTML is always sandboxed: pandoc's HTML reader fetches iframe contents while reading, so a
+    /// sandboxed look at it would not see what an unsandboxed run would load.
     static func needsSandbox(_ input: URL, pandoc: URL, format: String?) async -> Bool {
-        guard ["md", "markdown", "txt", "html", "htm"].contains(input.pathExtension.lowercased()),
+        guard ["md", "markdown", "txt"].contains(input.pathExtension.lowercased()),
               let json = try? await Shell.run(pandoc, ["--sandbox"] + (format.map { ["-f", $0] } ?? []) + ["-t", "json", input.path]),
               let tree = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
         else { return true }
-        if let meta = tree["meta"] as? [String: Any],
-           meta.keys.contains(where: { key in riskyMeta.contains { key.lowercased().contains($0) } }) {
+        if let meta = tree["meta"] as? [String: Any], meta.keys.contains(where: { !plainMeta.contains($0.lowercased()) }) {
             return true
         }
         var targets: [String] = []
@@ -399,7 +402,8 @@ enum Pandoc {
                 list.forEach(walk)
             }
         }
-        walk(tree["blocks"] ?? [])
+        // The whole tree: an image can sit inside a metadata value as well as in the text.
+        walk(tree)
         if rawIsRisky { return true }
         let folder = input.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/"
         return !targets.allSatisfy { isInside($0, folder: folder) }
@@ -457,8 +461,26 @@ enum HTMLSanitizer {
     static func neutralize(_ html: String) -> String {
         guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]),
               let root = doc.rootElement() else { return "" }
+        cleanAttributes(of: root)
         clean(root)
         return root.xmlString
+    }
+
+    /// Links stay clickable in the result; WebKit doesn't load them during import, and only these
+    /// schemes are kept anyway.
+    private static func isSafeLink(_ value: String) -> Bool {
+        let v = value.trimmingCharacters(in: .whitespaces).lowercased()
+        return v.hasPrefix("http://") || v.hasPrefix("https://") || v.hasPrefix("mailto:") || v.hasPrefix("#")
+    }
+
+    private static func cleanAttributes(of el: XMLElement) {
+        for attribute in el.attributes ?? [] {
+            let name = (attribute.localName ?? attribute.name ?? "").lowercased()
+            let isLink = name == "href" && (el.name ?? "").lowercased() == "a" && isSafeLink(attribute.stringValue ?? "")
+            if !keptAttributes.contains(name) && !isLink, let full = attribute.name {
+                el.removeAttribute(forName: full)
+            }
+        }
     }
 
     private static func clean(_ element: XMLElement) {
@@ -470,13 +492,7 @@ enum HTMLSanitizer {
                     el.detach()
                     continue
                 }
-                for attribute in el.attributes ?? [] {
-                    let name = (attribute.localName ?? attribute.name ?? "").lowercased()
-                    let isLink = name == "href" && (el.name ?? "").lowercased() == "a"
-                    if !keptAttributes.contains(name) && !isLink, let full = attribute.name {
-                        el.removeAttribute(forName: full)
-                    }
-                }
+                cleanAttributes(of: el)
                 clean(el)
             case .processingInstruction, .DTDKind, .entityDeclaration:
                 child.detach()
