@@ -353,44 +353,69 @@ enum Markdown {
     }
 }
 
-/// pandoc embeds the images and stylesheets a document points to. A file from elsewhere can point
-/// at a private file (~/.ssh/…) or a tracking URL, which would then end up inside the result or be
-/// fetched. pandoc runs with `--sandbox` unless every such reference stays inside the document's folder.
+/// pandoc embeds the images, covers and stylesheets a document points to. A file from elsewhere can
+/// point at a private file (~/.ssh/…) or a tracking URL, which would end up inside the result or be
+/// fetched. pandoc runs with `--sandbox` unless pandoc's own reading of the document shows that every
+/// such reference stays inside the document's folder. Anything unclear means the sandbox.
 enum Pandoc {
     static func run(_ pandoc: URL, _ args: [String], input: URL, sandbox: Bool? = nil) async throws {
-        let locked = sandbox ?? needsSandbox(input)
+        let format = args.firstIndex(of: "-f").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+        let locked: Bool
+        if let sandbox { locked = sandbox } else { locked = await needsSandbox(input, pandoc: pandoc, format: format) }
         try await Shell.run(pandoc, (locked ? ["--sandbox"] : []) + args, cwd: input.deletingLastPathComponent())
     }
 
-    private static let patterns: [NSRegularExpression] = [
-        #"!\[[^\]]*\]\(\s*<?([^)\s>]+)"#,                                  // ![alt](path)
-        #"(?m)^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)"#,                         // [ref]: path
-        #"(?i)\b(?:src|srcset|poster|data|background|xlink:href)\s*=\s*["']?([^"'\s>]+)"#,
-        #"(?i)<link\b[^>]*\bhref\s*=\s*["']?([^"'\s>]+)"#,
-        #"(?i)url\(\s*["']?([^"')\s]+)"#,
-        #"(?i)@import\s+["']([^"']+)"#,
-    ].map { try! NSRegularExpression(pattern: $0) }
+    /// Metadata pandoc may turn into a file read: covers, styles, fonts, bibliographies, includes.
+    private static let riskyMeta = ["image", "cover", "css", "font", "include", "bib", "csl", "abbreviation",
+                                    "reference", "template", "logo", "icon", "header"]
+    /// Raw HTML is passed through untouched, and the EPUB writer may still fetch what it names.
+    private static let riskyRaw = ["src", "href", "url", "style", "import", "&#", "data", "xlink", "background",
+                                   "poster", "<link", "<object", "<embed", "<iframe", "<svg", "<base"]
 
     /// Containers (DOCX, EPUB, ODT) carry their own media, so for them the sandbox costs nothing.
-    static func needsSandbox(_ input: URL) -> Bool {
+    static func needsSandbox(_ input: URL, pandoc: URL, format: String?) async -> Bool {
         guard ["md", "markdown", "txt", "html", "htm"].contains(input.pathExtension.lowercased()),
-              let text = try? String(contentsOf: input, encoding: .utf8) else { return true }
-        let folder = input.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/"
-        let range = NSRange(text.startIndex..., in: text)
-        for pattern in patterns {
-            for match in pattern.matches(in: text, range: range) {
-                guard let r = Range(match.range(at: 1), in: text) else { continue }
-                let ref = String(text[r])
-                if ref.hasPrefix("#") || ref.lowercased().hasPrefix("data:") { continue }
-                if ref.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#, options: .regularExpression) != nil { return true }
-                if ref.hasPrefix("/") || ref.hasPrefix("~") || ref.hasPrefix("\\") { return true }
-                let decoded = ref.removingPercentEncoding ?? ref
-                let target = URL(fileURLWithPath: decoded, relativeTo: URL(fileURLWithPath: folder))
-                    .resolvingSymlinksInPath().standardizedFileURL.path
-                if !target.hasPrefix(folder) { return true }
+              let json = try? await Shell.run(pandoc, ["--sandbox"] + (format.map { ["-f", $0] } ?? []) + ["-t", "json", input.path]),
+              let tree = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        else { return true }
+        if let meta = tree["meta"] as? [String: Any],
+           meta.keys.contains(where: { key in riskyMeta.contains { key.lowercased().contains($0) } }) {
+            return true
+        }
+        var targets: [String] = []
+        var rawIsRisky = false
+        func walk(_ node: Any) {
+            if let dict = node as? [String: Any] {
+                let type = dict["t"] as? String
+                if type == "Image", let c = dict["c"] as? [Any], c.count == 3, let target = (c[2] as? [Any])?.first as? String {
+                    targets.append(target)
+                }
+                if type == "RawInline" || type == "RawBlock", let c = dict["c"] as? [Any], let raw = c.last as? String {
+                    let lower = raw.lowercased()
+                    if riskyRaw.contains(where: lower.contains) { rawIsRisky = true }
+                }
+                dict.values.forEach(walk)
+            } else if let list = node as? [Any] {
+                list.forEach(walk)
             }
         }
-        return false
+        walk(tree["blocks"] ?? [])
+        if rawIsRisky { return true }
+        let folder = input.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/"
+        return !targets.allSatisfy { isInside($0, folder: folder) }
+    }
+
+    static func isInside(_ ref: String, folder: String) -> Bool {
+        if ref.lowercased().hasPrefix("data:") { return true }
+        for candidate in Set([ref, ref.removingPercentEncoding ?? ref]) {
+            if candidate.isEmpty { return false }
+            if candidate.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#, options: .regularExpression) != nil { return false }
+            if candidate.hasPrefix("/") || candidate.hasPrefix("~") || candidate.hasPrefix("\\") { return false }
+            let target = URL(fileURLWithPath: candidate, relativeTo: URL(fileURLWithPath: folder))
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            if !target.hasPrefix(folder) { return false }
+        }
+        return true
     }
 }
 
@@ -418,20 +443,46 @@ enum HTMLSanitizer {
         return String(decoding: data, as: UTF8.self)
     }
 
-    private static let rules: [(NSRegularExpression, String)] = [
-        (#"(?is)<script\b.*?</script\s*>"#, ""),
-        (#"(?is)<(iframe|object|embed|frameset|video|audio)\b.*?</\1\s*>"#, ""),
-        (#"(?i)<(iframe|object|embed|frame|base|link|meta|source|track)\b[^>]*>"#, ""),
-        (#"(?i)(\s)(src|srcset|poster|background|data|lowsrc|dynsrc|xlink:href)(\s*=)"#, "$1data-blocked-$2$3"),
-        (#"(?i)url\s*\("#, "blocked("),
-        (#"(?i)@import"#, "@blocked"),
-    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
+    /// Elements dropped with everything inside: anything that loads, runs or embeds.
+    private static let droppedElements: Set<String> = [
+        "script", "style", "link", "meta", "base", "iframe", "frame", "frameset", "object", "embed", "applet",
+        "img", "image", "picture", "source", "video", "audio", "track", "svg", "math", "canvas", "template",
+        "form", "input", "button", "select", "textarea", "portal", "noembed",
+    ]
+    /// Attributes kept. Everything else goes, including style (CSS can load) and every src-like name.
+    private static let keptAttributes: Set<String> = ["colspan", "rowspan", "align", "valign", "dir", "lang", "title", "start", "type"]
 
+    /// Parsed with libxml2's HTML tidy, not matched with patterns, so odd spellings
+    /// (`<img/src=…>`, entities inside CSS) never reach WebKit.
     static func neutralize(_ html: String) -> String {
-        var out = html
-        for (pattern, template) in rules {
-            out = pattern.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: template)
+        guard let doc = try? XMLDocument(xmlString: html, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]),
+              let root = doc.rootElement() else { return "" }
+        clean(root)
+        return root.xmlString
+    }
+
+    private static func clean(_ element: XMLElement) {
+        for child in element.children ?? [] {
+            switch child.kind {
+            case .element:
+                guard let el = child as? XMLElement else { continue }
+                if droppedElements.contains((el.localName ?? el.name ?? "").lowercased()) {
+                    el.detach()
+                    continue
+                }
+                for attribute in el.attributes ?? [] {
+                    let name = (attribute.localName ?? attribute.name ?? "").lowercased()
+                    let isLink = name == "href" && (el.name ?? "").lowercased() == "a"
+                    if !keptAttributes.contains(name) && !isLink, let full = attribute.name {
+                        el.removeAttribute(forName: full)
+                    }
+                }
+                clean(el)
+            case .processingInstruction, .DTDKind, .entityDeclaration:
+                child.detach()
+            default:
+                continue
+            }
         }
-        return out
     }
 }

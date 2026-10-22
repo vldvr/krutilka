@@ -42,14 +42,14 @@ enum Media {
             return seconds
         }
         guard let ffprobe = ExternalTools.shared.url(.ffprobe),
-              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "csv=p=0", url.path])
+              let out = try? await Shell.run(ffprobe, ["-v", "error"] + FFmpeg.safeInput + ["-show_entries", "format=duration", "-of", "csv=p=0", url.path])
         else { return nil }
         return Double(out.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     static func videoCodec(_ url: URL) async -> String? {
         guard let ffprobe = ExternalTools.shared.url(.ffprobe),
-              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", url.path])
+              let out = try? await Shell.run(ffprobe, ["-v", "error"] + FFmpeg.safeInput + ["-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", url.path])
         else { return nil }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }

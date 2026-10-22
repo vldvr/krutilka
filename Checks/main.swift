@@ -251,24 +251,45 @@ let hostileList = try await Shell.run(URL(fileURLWithPath: "/usr/bin/tar"), ["-t
 check(hostileList.contains("--checkpoint-action") && !fm.fileExists(atPath: fm.currentDirectoryPath + "/PWNED"),
       "option-like names in an archive stay names")
 
-let outside = file("outside.md", "# x\n\n![a](/etc/hosts)\n")
-let upward = file("upward.md", "![a](../secret.png)")
-let remote = file("remote.html", "<img src=\"https://example.com/t.png\">")
-let inside = file("inside.md", "![a](pics/a.png)\n\n[site](https://example.com)")
-check(Pandoc.needsSandbox(outside) && Pandoc.needsSandbox(upward) && Pandoc.needsSandbox(remote), "pandoc sandboxed for outside references")
-check(!Pandoc.needsSandbox(inside), "pandoc free when images stay in the folder")
-check(Pandoc.needsSandbox(root.appendingPathComponent("book.docx")), "pandoc always sandboxed for containers")
+if let pandoc = ExternalTools.shared.url(.pandoc) {
+    let outside = file("outside.md", "# x\n\n![a](/etc/hosts)\n")
+    let upward = file("upward.md", "![a](../secret.png)")
+    let entity = file("entity.md", "![a](&#47;etc/hosts)")
+    let cover = file("cover.md", "---\ncover-image: /etc/hosts\n---\n\ntext\n")
+    let raw = file("raw.md", "text <img src=\"/etc/hosts\"> more")
+    let remote = file("remote.html", "<img src=\"https://example.com/t.png\">")
+    let inside = file("inside.md", "![a](pics/a.png)\n\n[site](https://example.com)")
+    var sandboxed = true
+    for doc in [outside, upward, entity, cover, raw, remote] {
+        let format = doc.pathExtension == "md" ? "gfm" : nil
+        if !(await Pandoc.needsSandbox(doc, pandoc: pandoc, format: format)) { sandboxed = false; print("  not sandboxed: \(doc.lastPathComponent)") }
+    }
+    check(sandboxed, "pandoc sandboxed for outside paths, entities, covers, raw HTML, URLs")
+    let free = await Pandoc.needsSandbox(inside, pandoc: pandoc, format: "gfm")
+    check(!free, "pandoc free when images stay in the folder")
+}
+let container = await Pandoc.needsSandbox(root.appendingPathComponent("book.docx"), pandoc: URL(fileURLWithPath: "/usr/bin/false"), format: nil)
+check(container, "pandoc always sandboxed for containers")
 
-let cleaned = HTMLSanitizer.neutralize(#"<img src="file:///etc/hosts"><link rel=stylesheet href="http://x/s.css"><p style="background:url(http://x/b.png)">t</p><script>alert(1)</script>"#)
-check(!cleaned.contains(" src=") && !cleaned.contains("<link") && !cleaned.contains("url(") && !cleaned.contains("<script"),
-      "HTML import has nothing left to load")
+let cleaned = HTMLSanitizer.neutralize(#"<p>Hello <b>there</b></p><img/src="file:///etc/hosts"><IMG SRC=x><link rel=stylesheet href="http://x/s.css"><p style="background:u&#114;l(http://x/b.png)">t</p><svg><image href="/etc/hosts"/></svg><script>alert(1)</script><table><tr><td colspan="2">c</td></tr></table><a href="https://example.com">l</a>"#)
+check(!cleaned.lowercased().contains("src") && !cleaned.contains("<link") && !cleaned.contains("style") && !cleaned.contains("<script")
+      && !cleaned.contains("/etc/hosts") && !cleaned.contains("<svg"), "HTML import has nothing left to load")
+check(cleaned.contains("Hello") && cleaned.contains("<b>there</b>") && cleaned.contains("colspan=\"2\"") && cleaned.contains("href=\"https://example.com\""),
+      "HTML import keeps text, emphasis, tables and links")
 
 let playlist = file("movie.mp4", "#EXTM3U\n#EXTINF:1,\n/etc/hosts\n")
 var refused = false
-do { try await FFmpeg.refusePlaylist(playlist) } catch { refused = true }
-check(refused, "ffmpeg refuses a playlist posing as a video")
+do { try FFmpeg.refusePlaylist(playlist) } catch { refused = true }
+check(refused, "a playlist posing as a video gets a clear refusal")
 let ffmpegInput = try await FFmpeg.input(jpg)
-check(ffmpegInput.starts(with: ["-protocol_whitelist", "file"]), "ffmpeg reads local files only")
+check(ffmpegInput.starts(with: ["-protocol_whitelist", "file", "-format_whitelist"]) && !FFmpeg.demuxers.contains("concat")
+      && !FFmpeg.demuxers.contains("hls"), "ffmpeg reads local files in ordinary containers only")
+if let ffmpeg = ExternalTools.shared.url(.ffmpeg) {
+    let concat = file("joined.mp4", "ffconcat version 1.0\nfile /etc/hosts\n")
+    var blocked = false
+    do { try await Shell.run(ffmpeg, ["-v", "error"] + FFmpeg.safeInput + ["-i", concat.path, "-f", "null", "-"]) } catch { blocked = true }
+    check(blocked, "ffmpeg itself rejects a concat list even without the quick look")
+}
 
 // MARK: Report
 

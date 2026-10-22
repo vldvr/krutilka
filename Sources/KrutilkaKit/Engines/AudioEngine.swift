@@ -304,30 +304,28 @@ enum AudioEngine {
 
 /// ffmpeg with progress parsed from `-progress pipe:1`.
 enum FFmpeg {
-    /// `-i <file>` for a file that came from somewhere else. ffmpeg trusts contents over names, so a
-    /// ".mp4" can really be an HLS or concat playlist that pulls in other local files or URLs and
-    /// copies them into the output. Those are refused, and only the file protocol is allowed.
+    /// Demuxers for ordinary media containers. ffmpeg enforces this list itself, so a ".mp4" that is
+    /// really an HLS, DASH or concat playlist (which can pull in other local files or URLs and copy them
+    /// into the output) is refused by ffmpeg, whatever the file is called and whether ffprobe exists.
+    static let demuxers = ["mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm", "avi", "asf", "flv", "mpegts",
+                           "mpeg", "mp3", "wav", "aiff", "flac", "ogg", "aac", "ac3", "eac3", "amr", "caf", "w64", "wv",
+                           "ape", "mxf", "dv", "nut", "rm", "gif", "h264", "hevc", "m4v", "mpegvideo", "tta", "dsf",
+                           "truehd", "dts", "loas", "latm"].joined(separator: ",")
+
+    /// Input options for a file from somewhere else: local reads only, ordinary containers only.
+    static var safeInput: [String] { ["-protocol_whitelist", "file", "-format_whitelist", demuxers] }
+
+    /// `-i <file>` with those limits, after a quick look that gives a clear message for playlists.
     static func input(_ url: URL) async throws -> [String] {
-        try await refusePlaylist(url)
-        return ["-protocol_whitelist", "file", "-i", url.path]
+        try refusePlaylist(url)
+        return safeInput + ["-i", url.path]
     }
 
-    private static let playlistFormats: Set<String> = ["hls", "applehttp", "concat", "dash", "mpd", "ffconcat"]
-
-    static func refusePlaylist(_ url: URL) async throws {
-        if let handle = try? FileHandle(forReadingFrom: url) {
-            let head = String(decoding: (try? handle.read(upToCount: 4096)) ?? Data(), as: UTF8.self)
-            try? handle.close()
-            if ["#EXTM3U", "#EXT-X-", "ffconcat", "<MPD"].contains(where: { head.contains($0) }) {
-                throw KError.failed(tr("This file is a playlist that points to other files, not media."))
-            }
-        }
-        guard let ffprobe = ExternalTools.shared.url(.ffprobe),
-              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file",
-                                                       "-show_entries", "format=format_name", "-of", "csv=p=0", url.path])
-        else { return }
-        let names = out.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ",").map(String.init)
-        if names.contains(where: playlistFormats.contains) {
+    static func refusePlaylist(_ url: URL) throws {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? handle.close() }
+        let head = String(decoding: (try? handle.read(upToCount: 4096)) ?? Data(), as: UTF8.self)
+        if ["#EXTM3U", "#EXT-X-", "ffconcat", "<MPD"].contains(where: { head.contains($0) }) {
             throw KError.failed(tr("This file is a playlist that points to other files, not media."))
         }
     }
