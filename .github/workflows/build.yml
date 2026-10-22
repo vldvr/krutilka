@@ -1,0 +1,55 @@
+name: Сборка
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: Проверки и образ диска
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Самый новый Xcode (для стекла macOS 26)
+        run: |
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$latest" ]; then sudo xcode-select -s "$latest"; fi
+          swift --version
+      - name: Проверки
+        run: swift run krutilka-checks
+      - name: Приложение и .dmg
+        run: scripts/build-app.sh --dmg
+      - name: Проверка собранного приложения
+        run: |
+          app=build/Krutilka.app/Contents/MacOS/Krutilka
+          lipo -archs "$app" | grep -q arm64
+          lipo -archs "$app" | grep -q x86_64
+          "$app" --op convert list Resources/AppIcon.png | grep -q heic
+          "$app" --op tools compress Resources/AppIcon.png | grep -q '^OK'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos
+          path: dist/*.dmg
+
+  release:
+    name: Релиз
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
+          generate_release_notes: true

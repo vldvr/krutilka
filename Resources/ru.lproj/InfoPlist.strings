@@ -1,0 +1,3 @@
+"CFBundleDisplayName" = "Крутилка";
+"CFBundleName" = "Крутилка";
+"NSAppleEventsUsageDescription" = "Крутилка спрашивает у Finder, какие файлы выделены, когда вы нажимаете сочетание клавиш.";
