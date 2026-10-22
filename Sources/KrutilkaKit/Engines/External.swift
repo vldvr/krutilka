@@ -92,7 +92,7 @@ final class ExternalTools {
 /// Runs a command-line tool off the main thread. Cancelling the Swift task terminates the process.
 enum Shell {
     @discardableResult
-    static func run(_ executable: URL, _ args: [String], cwd: URL? = nil,
+    static func run(_ executable: URL, _ args: [String], cwd: URL? = nil, environment extra: [String: String] = [:],
                     onLine: ((String) -> Void)? = nil) async throws -> String {
         let process = Process()
         process.executableURL = executable
@@ -100,6 +100,7 @@ enum Shell {
         if let cwd { process.currentDirectoryURL = cwd }
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env.merge(extra) { $1 }
         process.environment = env
 
         let out = Pipe(), err = Pipe()
@@ -154,4 +155,32 @@ final class LockedBuffer {
 /// (AppKit and AVFoundation objects used from one place at a time).
 struct Unchecked<Value>: @unchecked Sendable {
     let value: Value
+}
+
+/// ImageMagick reads dozens of formats, some of which can read other files or the network
+/// (MVG, MSL, TEXT, URL…). Every call names the input format explicitly and runs under a policy
+/// that switches those coders and all external delegates off.
+enum Magick {
+    static func run(_ args: [String]) async throws {
+        let magick = try ExternalTools.shared.require(.magick)
+        try await Shell.run(magick, args, environment: ["MAGICK_CONFIGURE_PATH": policyFolder.path])
+    }
+
+    /// `png:/path/file.png`: the decoder is chosen by us, not guessed from the file's contents.
+    static func input(_ url: URL, as coder: String) -> String { "\(coder):\(url.path)" }
+
+    private static let policyFolder: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Krutilka/ImageMagick", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let policy = """
+        <policymap>
+          <policy domain="delegate" rights="none" pattern="*" />
+          <policy domain="coder" rights="none" pattern="{MVG,MSL,TEXT,TXT,URL,HTTP,HTTPS,FTP,EPHEMERAL,SHOW,WIN,X,PLT,LABEL,CAPTION,PANGO,PS,EPS,EPI,PDF,XPS}" />
+          <policy domain="path" rights="none" pattern="@*" />
+        </policymap>
+        """
+        try? policy.write(to: dir.appendingPathComponent("policy.xml"), atomically: true, encoding: .utf8)
+        return dir
+    }()
 }

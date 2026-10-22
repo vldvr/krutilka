@@ -237,6 +237,39 @@ check(Recipe.defaults.count == 3 && Recipe.defaults[0].summary.hasPrefix("WEBP")
 let abc = file("abc.txt", "abc")
 check(try Hashing.sha256(abc) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 of abc")
 
+// MARK: Files from strangers
+
+check(ArchiveEngine.safeName("--checkpoint=1") == "./--checkpoint=1", "tar sees file names, not options")
+let hostile = root.appendingPathComponent("hostile", isDirectory: true)
+try fm.createDirectory(at: hostile, withIntermediateDirectories: true)
+for name in ["--checkpoint=1", "--checkpoint-action=exec=touch PWNED", "ok.txt"] {
+    fm.createFile(atPath: hostile.appendingPathComponent(name).path, contents: Data())
+}
+let hostileZip = try await ArchiveEngine.pack([hostile], as: .zip, ctx: context([hostile]))
+let hostileTar = try await ArchiveEngine.repack(hostileZip, as: .tgz, ctx: context([hostileZip]))
+let hostileList = try await Shell.run(URL(fileURLWithPath: "/usr/bin/tar"), ["-tzf", hostileTar.path])
+check(hostileList.contains("--checkpoint-action") && !fm.fileExists(atPath: fm.currentDirectoryPath + "/PWNED"),
+      "option-like names in an archive stay names")
+
+let outside = file("outside.md", "# x\n\n![a](/etc/hosts)\n")
+let upward = file("upward.md", "![a](../secret.png)")
+let remote = file("remote.html", "<img src=\"https://example.com/t.png\">")
+let inside = file("inside.md", "![a](pics/a.png)\n\n[site](https://example.com)")
+check(Pandoc.needsSandbox(outside) && Pandoc.needsSandbox(upward) && Pandoc.needsSandbox(remote), "pandoc sandboxed for outside references")
+check(!Pandoc.needsSandbox(inside), "pandoc free when images stay in the folder")
+check(Pandoc.needsSandbox(root.appendingPathComponent("book.docx")), "pandoc always sandboxed for containers")
+
+let cleaned = HTMLSanitizer.neutralize(#"<img src="file:///etc/hosts"><link rel=stylesheet href="http://x/s.css"><p style="background:url(http://x/b.png)">t</p><script>alert(1)</script>"#)
+check(!cleaned.contains(" src=") && !cleaned.contains("<link") && !cleaned.contains("url(") && !cleaned.contains("<script"),
+      "HTML import has nothing left to load")
+
+let playlist = file("movie.mp4", "#EXTM3U\n#EXTINF:1,\n/etc/hosts\n")
+var refused = false
+do { try await FFmpeg.refusePlaylist(playlist) } catch { refused = true }
+check(refused, "ffmpeg refuses a playlist posing as a video")
+let ffmpegInput = try await FFmpeg.input(jpg)
+check(ffmpegInput.starts(with: ["-protocol_whitelist", "file"]), "ffmpeg reads local files only")
+
 // MARK: Report
 
 print("\(passed) passed, \(failed.count) failed")

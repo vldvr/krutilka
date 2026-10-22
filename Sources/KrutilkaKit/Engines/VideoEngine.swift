@@ -42,14 +42,14 @@ enum Media {
             return seconds
         }
         guard let ffprobe = ExternalTools.shared.url(.ffprobe),
-              let out = try? await Shell.run(ffprobe, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", url.path])
+              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "csv=p=0", url.path])
         else { return nil }
         return Double(out.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     static func videoCodec(_ url: URL) async -> String? {
         guard let ffprobe = ExternalTools.shared.url(.ffprobe),
-              let out = try? await Shell.run(ffprobe, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", url.path])
+              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", url.path])
         else { return nil }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -154,7 +154,7 @@ enum VideoEngine {
     private static func ffmpegConvert(_ input: URL, to out: URL, target: VideoTarget, ctx: JobContext) async throws {
         let ffmpeg = try ExternalTools.shared.require(.ffmpeg)
         let duration = await Media.duration(input)
-        var args = ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path]
+        var args = ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input))
         switch target {
         case .webm:
             args += ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used", "4", "-c:a", "libopus", "-b:a", "128k"]
@@ -179,7 +179,7 @@ enum VideoEngine {
         } catch let error as KError where target == .mkv {
             // Some streams can't be copied into Matroska as-is; re-encode them.
             _ = error
-            try await FFmpeg.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path,
+            try await FFmpeg.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [
                                           "-c:v", "libx264", "-crf", "20", "-preset", "veryfast", "-c:a", "aac", out.path],
                                  duration: duration, ctx: ctx)
         }
@@ -189,7 +189,7 @@ enum VideoEngine {
     private static func makeGIF(_ input: URL, to out: URL, ctx: JobContext) async throws {
         if let ffmpeg = ExternalTools.shared.url(.ffmpeg) {
             let filter = "fps=12,scale='min(640,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
-            try await FFmpeg.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path, "-t", "60",
+            try await FFmpeg.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [ "-t", "60",
                                           "-vf", filter, "-loop", "0", out.path],
                                  duration: min(await Media.duration(input) ?? 60, 60), ctx: ctx)
             return
@@ -319,7 +319,7 @@ enum VideoEngine {
         let type: AVFileType = input.pathExtension.lowercased() == "mov" ? .mov : .mp4
         let out = ctx.destination(for: input, ext: type == .mov ? "mov" : "mp4", suffix: tr("no metadata"))
         if let ffmpeg = ExternalTools.shared.url(.ffmpeg) {
-            try await Shell.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path, "-map", "0",
+            try await Shell.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [ "-map", "0",
                                          "-map_metadata", "-1", "-map_chapters", "-1", "-c", "copy", out.path])
         } else {
             try await Media.export(AVURLAsset(url: input), preset: AVAssetExportPresetPassthrough, type: type, to: out, ctx: ctx, forSharing: true)

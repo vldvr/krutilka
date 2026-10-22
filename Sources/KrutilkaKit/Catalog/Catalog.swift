@@ -151,7 +151,9 @@ enum Catalog {
                 let md = try ctx.scratch().appendingPathComponent(url.deletingPathExtension().lastPathComponent + ".md")
                 try PDFEngine.text(of: url, ctx: ctx).write(to: md, atomically: true, encoding: .utf8)
                 let out = ctx.destination(for: url, ext: "epub")
-                try await Shell.run(try tools.require(.pandoc), [md.path, "-o", out.path, "--metadata", "title=\(url.deletingPathExtension().lastPathComponent)"])
+                // The text comes from someone else's PDF and could spell out Markdown image paths.
+                try await Pandoc.run(try tools.require(.pandoc), [md.path, "-o", out.path, "--metadata", "title=\(url.deletingPathExtension().lastPathComponent)"],
+                                     input: md, sandbox: true)
                 return [out]
             }
         case .document, .markdown:

@@ -82,14 +82,25 @@ enum ImageEngine {
 
     private static func rasterizeSVG(_ url: URL, ctx: JobContext?) async throws -> CGImage {
         if let image = NSImage(contentsOf: url), image.size.width > 0 {
+            // Vector art gets a longest side of 2048 px (never smaller than drawn), whatever the screen.
             let longest = max(image.size.width, image.size.height)
             let scale = max(1, 2048 / longest)
-            var rect = NSRect(origin: .zero, size: NSSize(width: image.size.width * scale, height: image.size.height * scale))
-            if let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) { return cg }
+            let w = Int((image.size.width * scale).rounded()), h = Int((image.size.height * scale).rounded())
+            if let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8,
+                                          samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                          bytesPerRow: 0, bitsPerPixel: 0) {
+                rep.size = NSSize(width: w, height: h)
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                image.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+                NSGraphicsContext.restoreGraphicsState()
+                if let cg = rep.cgImage { return cg }
+            }
         }
-        if let magick = ExternalTools.shared.url(.magick), let ctx {
+        // ImageMagick only if macOS can't read it; Homebrew's build may need a delegate the policy forbids.
+        if ExternalTools.shared.has(.magick), let ctx {
             let out = try ctx.scratch().appendingPathComponent("svg.png")
-            try await Shell.run(magick, ["-background", "none", "-density", "300", url.path, out.path])
+            try await Magick.run(["-background", "none", "-density", "300", Magick.input(url, as: "svg"), out.path])
             return try await load(out)
         }
         throw KError.unreadable(url.lastPathComponent)
@@ -154,10 +165,10 @@ enum ImageEngine {
             guard let uti = target.uti else { throw KError.failed(tr("This format can't be written.")) }
             if writableTypes.contains(uti), let data = encode(img, uti: uti, quality: target.isLossy ? quality : nil, properties: properties) {
                 try data.write(to: out)
-            } else if let magick = ExternalTools.shared.url(.magick) {
+            } else if ExternalTools.shared.has(.magick) {
                 let png = try ctx.scratch().appendingPathComponent(UUID().uuidString + ".png")
                 try encode(img, uti: "public.png", quality: nil)?.write(to: png)
-                try await Shell.run(magick, [png.path, "-quality", "\(Int(quality * 100))", out.path])
+                try await Magick.run([Magick.input(png, as: "png"), "-quality", "\(Int(quality * 100))", out.path])
             } else {
                 throw KError.failed(trf("This Mac can't save %@.", target.code))
             }
@@ -172,8 +183,8 @@ enum ImageEngine {
         let tools = ExternalTools.shared
         if let cwebp = tools.url(.cwebp) {
             try await Shell.run(cwebp, ["-quiet", "-q", q, "-metadata", "icc", png.path, "-o", out.path])
-        } else if let magick = tools.url(.magick) {
-            try await Shell.run(magick, [png.path, "-quality", q, out.path])
+        } else if tools.has(.magick) {
+            try await Magick.run([Magick.input(png, as: "png"), "-quality", q, out.path])
         } else if let ffmpeg = tools.url(.ffmpeg) {
             try await Shell.run(ffmpeg, ["-y", "-loglevel", "error", "-i", png.path, "-c:v", "libwebp", "-quality", q, out.path])
         } else {
@@ -257,9 +268,9 @@ enum ImageEngine {
         var target = sameFormat(input)
         if [.png, .tiff, .bmp].contains(target) && !hasAlpha(image) { target = .jpeg }
         let suffix = tr("compressed")
-        if target == .png, let magick = ExternalTools.shared.url(.magick) {
+        if target == .png, ExternalTools.shared.has(.magick) {
             let out = ctx.destination(for: input, ext: "png", suffix: suffix)
-            try await Shell.run(magick, [input.path, "-strip", "-colors", "256", "-define", "png:compression-level=9", out.path])
+            try await Magick.run([Magick.input(input, as: "png"), "-strip", "-colors", "256", "-define", "png:compression-level=9", out.path])
             return out
         }
         let out = ctx.destination(for: input, ext: target.ext, suffix: suffix)

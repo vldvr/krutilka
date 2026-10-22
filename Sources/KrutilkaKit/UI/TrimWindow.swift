@@ -241,7 +241,7 @@ enum Trimmer {
         if let ffmpeg = ExternalTools.shared.url(.ffmpeg), isAudio || !Media.isNative(input) {
             let out = ctx.destination(for: input, ext: ext, suffix: suffix)
             try await Shell.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error",
-                                         "-ss", String(format: "%.3f", range.start.seconds), "-i", input.path,
+                                         "-ss", String(format: "%.3f", range.start.seconds), ] + (try await FFmpeg.input(input)) + [
                                          "-t", String(format: "%.3f", range.duration.seconds),
                                          "-map", "0", "-c", "copy", out.path])
             return out

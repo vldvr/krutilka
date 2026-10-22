@@ -70,7 +70,7 @@ enum AudioEngine {
         let tools = ExternalTools.shared
 
         if let ffmpeg = tools.url(.ffmpeg), [.mp3, .ogg, .opus].contains(target) || !nativeInputs.contains(ext) {
-            var args = ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path, "-vn", "-map_metadata", "0"]
+            var args = ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [ "-vn", "-map_metadata", "0"]
             if let channels { args += ["-ac", "\(channels)"] }
             switch target {
             case .mp3: args += ["-c:a", "libmp3lame", "-b:a", "\(kbps)k", "-id3v2_version", "3"]
@@ -230,7 +230,7 @@ enum AudioEngine {
         let target = keepFormat(input)
         let out = ctx.destination(for: input, ext: target.ext, suffix: tr("normalized"))
         if let ffmpeg = ExternalTools.shared.url(.ffmpeg) {
-            var args = ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path, "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+            var args = ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [ "-vn", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
             switch target {
             case .mp3: args += ["-c:a", "libmp3lame", "-b:a", "\(ctx.settings.audioBitrate)k"]
             case .m4a: args += ["-c:a", "aac", "-b:a", "\(ctx.settings.audioBitrate)k"]
@@ -277,7 +277,7 @@ enum AudioEngine {
     static func stripMetadata(_ input: URL, ctx: JobContext) async throws -> URL {
         let ffmpeg = try ExternalTools.shared.require(.ffmpeg)
         let out = ctx.destination(for: input, ext: input.pathExtension, suffix: tr("no metadata"))
-        try await Shell.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", "-i", input.path,
+        try await Shell.run(ffmpeg, ["-y", "-hide_banner", "-loglevel", "error", ] + (try await FFmpeg.input(input)) + [
                                      "-map", "0:a", "-map_metadata", "-1", "-c", "copy", out.path])
         return out
     }
@@ -304,6 +304,34 @@ enum AudioEngine {
 
 /// ffmpeg with progress parsed from `-progress pipe:1`.
 enum FFmpeg {
+    /// `-i <file>` for a file that came from somewhere else. ffmpeg trusts contents over names, so a
+    /// ".mp4" can really be an HLS or concat playlist that pulls in other local files or URLs and
+    /// copies them into the output. Those are refused, and only the file protocol is allowed.
+    static func input(_ url: URL) async throws -> [String] {
+        try await refusePlaylist(url)
+        return ["-protocol_whitelist", "file", "-i", url.path]
+    }
+
+    private static let playlistFormats: Set<String> = ["hls", "applehttp", "concat", "dash", "mpd", "ffconcat"]
+
+    static func refusePlaylist(_ url: URL) async throws {
+        if let handle = try? FileHandle(forReadingFrom: url) {
+            let head = String(decoding: (try? handle.read(upToCount: 4096)) ?? Data(), as: UTF8.self)
+            try? handle.close()
+            if ["#EXTM3U", "#EXT-X-", "ffconcat", "<MPD"].contains(where: { head.contains($0) }) {
+                throw KError.failed(tr("This file is a playlist that points to other files, not media."))
+            }
+        }
+        guard let ffprobe = ExternalTools.shared.url(.ffprobe),
+              let out = try? await Shell.run(ffprobe, ["-v", "error", "-protocol_whitelist", "file",
+                                                       "-show_entries", "format=format_name", "-of", "csv=p=0", url.path])
+        else { return }
+        let names = out.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ",").map(String.init)
+        if names.contains(where: playlistFormats.contains) {
+            throw KError.failed(tr("This file is a playlist that points to other files, not media."))
+        }
+    }
+
     static func run(_ ffmpeg: URL, _ args: [String], duration: Double?, ctx: JobContext) async throws {
         var full = args
         if let output = full.popLast() {

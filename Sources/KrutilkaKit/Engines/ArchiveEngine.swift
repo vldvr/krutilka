@@ -48,6 +48,17 @@ enum ArchiveEngine {
         }
     }
 
+    /// "./name": a file called "--checkpoint-action=…" stays a file name for tar instead of becoming an option.
+    static func safeName(_ name: String) -> String { "./" + name }
+
+    static func removeJunk(in folder: URL) {
+        let fm = FileManager.default
+        guard let walker = fm.enumerator(at: folder, includingPropertiesForKeys: nil) else { return }
+        for case let url as URL in walker where [".DS_Store", "__MACOSX"].contains(url.lastPathComponent) {
+            try? fm.removeItem(at: url)
+        }
+    }
+
     /// Unpacks into a folder named after the archive. A single top-level item is lifted out,
     /// the way Archive Utility does it.
     static func extract(_ input: URL, ctx: JobContext, into parent: URL? = nil) async throws -> URL {
@@ -92,18 +103,26 @@ enum ArchiveEngine {
         let out = Naming.unique(dir.appendingPathComponent(base + "." + target.ext))
         switch target {
         case .zip:
-            if inputs.count == 1 {
-                // No __MACOSX folder or ._ files: the archive opens cleanly on Windows and Linux too.
+            var isFolder: ObjCBool = false
+            FileManager.default.fileExists(atPath: first.path, isDirectory: &isFolder)
+            if inputs.count == 1 && !isFolder.boolValue {
                 try await Shell.run(ditto, ["-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", first.path, out.path])
             } else {
-                try await Shell.run(URL(fileURLWithPath: "/usr/bin/zip"),
-                                    ["-q", "-r", "-y", "-nw", out.path] + inputs.map(\.lastPathComponent) + ["-x", "*.DS_Store", "-x", "__MACOSX/*"],
-                                    cwd: parent)
+                // Clone the items (cheap on APFS) into one folder, drop .DS_Store, zip the folder's contents.
+                // File names never reach a command line, where a name like "--option" could be read as one.
+                let fm = FileManager.default
+                let staging = try ctx.scratch().appendingPathComponent("zip-" + UUID().uuidString, isDirectory: true)
+                try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+                for url in inputs {
+                    try fm.copyItem(at: url, to: Naming.unique(staging.appendingPathComponent(url.lastPathComponent)))
+                }
+                removeJunk(in: staging)
+                try await Shell.run(ditto, ["-c", "-k", "--norsrc", "--noextattr", "--noacl", staging.path, out.path])
             }
         case .tgz, .tar:
             let flags = target == .tgz ? "-czf" : "-cf"
             try await Shell.run(tar, [flags, out.path, "--no-mac-metadata", "--exclude", ".DS_Store", "-C", parent.path]
-                                + inputs.map(\.lastPathComponent))
+                                + inputs.map { safeName($0.lastPathComponent) })
         case .folder:
             break
         }
@@ -121,10 +140,10 @@ enum ArchiveEngine {
         let out = Naming.unique(ctx.directory(for: input).appendingPathComponent(baseName(input) + "." + target.ext))
         let flags = target == .tgz ? "-czf" : "-cf"
         if target == .zip {
-            try await Shell.run(URL(fileURLWithPath: "/usr/bin/zip"),
-                                ["-q", "-r", "-y", "-nw", out.path] + items.map(\.lastPathComponent), cwd: unpacked)
+            // The names came out of someone else's archive: keep them off the command line.
+            try await Shell.run(ditto, ["-c", "-k", "--norsrc", "--noextattr", "--noacl", unpacked.path, out.path])
         } else {
-            try await Shell.run(tar, [flags, out.path, "--no-mac-metadata", "-C", unpacked.path] + items.map(\.lastPathComponent))
+            try await Shell.run(tar, [flags, out.path, "--no-mac-metadata", "-C", unpacked.path] + items.map { safeName($0.lastPathComponent) })
         }
         return out
     }

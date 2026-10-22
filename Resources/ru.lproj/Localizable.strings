@@ -329,3 +329,4 @@
 "White" = "Белый";
 "Black ink" = "Чёрный";
 "Version" = "Версия";
+"This file is a playlist that points to other files, not media." = "Это не медиафайл, а плейлист со ссылками на другие файлы.";

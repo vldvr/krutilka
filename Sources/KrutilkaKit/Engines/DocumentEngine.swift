@@ -44,7 +44,7 @@ enum DocumentEngine {
         // Markdown to PDF: pandoc lays it out as Word, LibreOffice prints it. Proper headings, lists, tables.
         if target == .pdf, ["md", "markdown"].contains(ext), let pandoc = tools.url(.pandoc), tools.has(.soffice) {
             let docx = try ctx.scratch().appendingPathComponent(input.deletingPathExtension().lastPathComponent + ".docx")
-            try await Shell.run(pandoc, [input.path, "-f", "gfm", "-o", docx.path], cwd: input.deletingLastPathComponent())
+            try await Pandoc.run(pandoc, [input.path, "-f", "gfm", "-o", docx.path], input: input)
             let produced = try await OfficeEngine.convert(docx, filter: "pdf", ext: "pdf", ctx: ctx)
             let out = ctx.destination(for: input, ext: "pdf")
             try FileManager.default.moveItem(at: produced, to: out)
@@ -59,7 +59,7 @@ enum DocumentEngine {
             if ext == "md" || ext == "markdown" { args += ["-f", "gfm"] }
             if target == .md { args += ["-t", "gfm"] }
             if target == .txt { args += ["-t", "plain"] }
-            try await Shell.run(pandoc, args, cwd: input.deletingLastPathComponent())
+            try await Pandoc.run(pandoc, args, input: input)
             return out
         }
 
@@ -91,7 +91,7 @@ enum DocumentEngine {
         case "epub":
             let pandoc = try ExternalTools.shared.require(.pandoc)
             let html = try ctx.scratch().appendingPathComponent("book.html")
-            try await Shell.run(pandoc, [url.path, "-o", html.path, "--standalone"])
+            try await Pandoc.run(pandoc, [url.path, "-o", html.path, "--standalone"], input: url)
             return try await read(html, ctx: ctx)
         default:
             let type: NSAttributedString.DocumentType
@@ -109,9 +109,16 @@ enum DocumentEngine {
             if type == .plain || type == .html { options[.characterEncoding] = String.Encoding.utf8.rawValue }
             // HTML and web archives are parsed with WebKit, which wants the main thread.
             if type == .html || type == .webArchive {
-                let readOptions = Unchecked(value: options)
+                // WebKit would fetch every image, frame and stylesheet the page points to: local files
+                // and tracking URLs alike. Parse a copy with those references switched off.
+                let html = Data(HTMLSanitizer.neutralize(try HTMLSanitizer.markup(of: url, webArchive: type == .webArchive)).utf8)
+                let htmlOptions: [NSAttributedString.DocumentReadingOptionKey: Any] = [
+                    .documentType: NSAttributedString.DocumentType.html,
+                    .characterEncoding: String.Encoding.utf8.rawValue,
+                ]
+                let readOptions = Unchecked(value: htmlOptions)
                 return try await MainActor.run {
-                    Unchecked(value: try NSAttributedString(url: url, options: readOptions.value, documentAttributes: nil))
+                    Unchecked(value: try NSAttributedString(data: html, options: readOptions.value, documentAttributes: nil))
                 }.value
             }
             do {
@@ -138,7 +145,7 @@ enum DocumentEngine {
             let pandoc = try ExternalTools.shared.require(.pandoc)
             let html = try ctx.scratch().appendingPathComponent("doc.html")
             try await write(text, as: .html, to: html, ctx: ctx)
-            try await Shell.run(pandoc, [html.path, "-o", out.path, "--standalone"])
+            try await Pandoc.run(pandoc, [html.path, "-o", out.path, "--standalone"], input: html, sandbox: true)
         default:
             let type: NSAttributedString.DocumentType
             switch target {
@@ -343,5 +350,88 @@ enum Markdown {
             lines.append(line)
         }
         return lines.joined(separator: "\n\n").replacingOccurrences(of: "\n\n\n\n", with: "\n\n") + "\n"
+    }
+}
+
+/// pandoc embeds the images and stylesheets a document points to. A file from elsewhere can point
+/// at a private file (~/.ssh/…) or a tracking URL, which would then end up inside the result or be
+/// fetched. pandoc runs with `--sandbox` unless every such reference stays inside the document's folder.
+enum Pandoc {
+    static func run(_ pandoc: URL, _ args: [String], input: URL, sandbox: Bool? = nil) async throws {
+        let locked = sandbox ?? needsSandbox(input)
+        try await Shell.run(pandoc, (locked ? ["--sandbox"] : []) + args, cwd: input.deletingLastPathComponent())
+    }
+
+    private static let patterns: [NSRegularExpression] = [
+        #"!\[[^\]]*\]\(\s*<?([^)\s>]+)"#,                                  // ![alt](path)
+        #"(?m)^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)"#,                         // [ref]: path
+        #"(?i)\b(?:src|srcset|poster|data|background|xlink:href)\s*=\s*["']?([^"'\s>]+)"#,
+        #"(?i)<link\b[^>]*\bhref\s*=\s*["']?([^"'\s>]+)"#,
+        #"(?i)url\(\s*["']?([^"')\s]+)"#,
+        #"(?i)@import\s+["']([^"']+)"#,
+    ].map { try! NSRegularExpression(pattern: $0) }
+
+    /// Containers (DOCX, EPUB, ODT) carry their own media, so for them the sandbox costs nothing.
+    static func needsSandbox(_ input: URL) -> Bool {
+        guard ["md", "markdown", "txt", "html", "htm"].contains(input.pathExtension.lowercased()),
+              let text = try? String(contentsOf: input, encoding: .utf8) else { return true }
+        let folder = input.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path + "/"
+        let range = NSRange(text.startIndex..., in: text)
+        for pattern in patterns {
+            for match in pattern.matches(in: text, range: range) {
+                guard let r = Range(match.range(at: 1), in: text) else { continue }
+                let ref = String(text[r])
+                if ref.hasPrefix("#") || ref.lowercased().hasPrefix("data:") { continue }
+                if ref.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#, options: .regularExpression) != nil { return true }
+                if ref.hasPrefix("/") || ref.hasPrefix("~") || ref.hasPrefix("\\") { return true }
+                let decoded = ref.removingPercentEncoding ?? ref
+                let target = URL(fileURLWithPath: decoded, relativeTo: URL(fileURLWithPath: folder))
+                    .resolvingSymlinksInPath().standardizedFileURL.path
+                if !target.hasPrefix(folder) { return true }
+            }
+        }
+        return false
+    }
+}
+
+/// Turns off everything in a page that would make WebKit load something while importing it.
+enum HTMLSanitizer {
+    static func markup(of url: URL, webArchive: Bool) throws -> String {
+        var data = try Data(contentsOf: url)
+        var encodingName: String?
+        if webArchive {
+            guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                  let main = plist["WebMainResource"] as? [String: Any],
+                  let body = main["WebResourceData"] as? Data else { throw KError.unreadable(url.lastPathComponent) }
+            data = body
+            encodingName = main["WebResourceTextEncodingName"] as? String
+        }
+        if let encodingName {
+            let cf = CFStringConvertIANACharSetNameToEncoding(encodingName as CFString)
+            if cf != kCFStringEncodingInvalidId,
+               let text = String(data: data, encoding: String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(cf))) {
+                return text
+            }
+        }
+        if let text = String(data: data, encoding: .utf8) { return text }
+        if let text = String(data: data, encoding: .windowsCP1251) { return text }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static let rules: [(NSRegularExpression, String)] = [
+        (#"(?is)<script\b.*?</script\s*>"#, ""),
+        (#"(?is)<(iframe|object|embed|frameset|video|audio)\b.*?</\1\s*>"#, ""),
+        (#"(?i)<(iframe|object|embed|frame|base|link|meta|source|track)\b[^>]*>"#, ""),
+        (#"(?i)(\s)(src|srcset|poster|background|data|lowsrc|dynsrc|xlink:href)(\s*=)"#, "$1data-blocked-$2$3"),
+        (#"(?i)url\s*\("#, "blocked("),
+        (#"(?i)@import"#, "@blocked"),
+    ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
+
+    static func neutralize(_ html: String) -> String {
+        var out = html
+        for (pattern, template) in rules {
+            out = pattern.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: template)
+        }
+        return out
     }
 }
