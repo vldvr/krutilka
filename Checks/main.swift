@@ -142,6 +142,10 @@ let merged = try await PDFEngine.merge([pdf, jpg], ctx: context([pdf, jpg]))
 check(PDFDocument(url: merged)?.pageCount == 3, "merge takes PDFs and pictures")
 let pagePictures = try await PDFEngine.toImages(pdf, as: .png, ctx: context([pdf]))
 check(pagePictures.count == 1 && FileKind.of(pagePictures[0]) == .folder, "multi-page PDF to pictures goes into a folder")
+let onePicture = try await PDFEngine.toSingleImage(pdf, as: .jpeg, ctx: context([pdf]))
+if let size = pixelSize(onePicture) {
+    check(onePicture.pathExtension == "jpg" && size.height > size.width, "multi-page PDF to one tall JPG")
+} else { check(false, "multi-page PDF to one tall JPG") }
 
 // MARK: Documents
 

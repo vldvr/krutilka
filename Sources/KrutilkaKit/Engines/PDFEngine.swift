@@ -98,6 +98,53 @@ enum PDFEngine {
         return folder.map { [$0] } ?? outputs
     }
 
+    /// All pages stacked top to bottom in one picture, on white.
+    static func toSingleImage(_ input: URL, as target: ImageTarget, ctx: JobContext) async throws -> URL {
+        let doc = try open(input)
+        let count = doc.pageCount
+        guard count > 0 else { throw KError.nothingToDo(tr("This PDF has no pages.")) }
+        var sizes: [CGSize] = []
+        for i in 0..<count {
+            guard let page = doc.page(at: i) else { continue }
+            let b = page.bounds(for: .mediaBox)
+            sizes.append(page.rotation % 180 != 0 ? CGSize(width: b.height, height: b.width) : b.size)
+        }
+        let points = CGSize(width: sizes.map(\.width).max() ?? 0, height: sizes.map(\.height).reduce(0, +))
+        guard points.width > 0, points.height > 0 else { throw KError.nothingToDo(tr("This PDF has no pages.")) }
+        // JPEG tops out at 65 535 px a side; also keep the canvas within memory (~200 MP).
+        var scale = CGFloat(ctx.settings.pdfDPI) / 72
+        scale = min(scale, 65_000 / points.height, 65_000 / points.width)
+        scale = min(scale, (200_000_000 / (points.width * points.height)).squareRoot())
+        let width = Int((points.width * scale).rounded()), height = Int((points.height * scale).rounded())
+        guard let canvas = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                     space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                     bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+            throw KError.failed(tr("Couldn't create the picture."))
+        }
+        canvas.setFillColor(.white)
+        canvas.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        canvas.interpolationQuality = .high
+        var top = CGFloat(height)
+        for i in 0..<count {
+            try Task.checkCancellation()
+            guard let page = doc.page(at: i) else { continue }
+            let b = page.bounds(for: .mediaBox)
+            let rotated = page.rotation % 180 != 0
+            let w = ((rotated ? b.height : b.width) * scale).rounded(), h = ((rotated ? b.width : b.height) * scale).rounded()
+            let rect = CGRect(x: ((CGFloat(width) - w) / 2).rounded(), y: top - h, width: w, height: h)
+            if let image = page.thumbnail(of: NSSize(width: w, height: h), for: .mediaBox)
+                .cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                canvas.draw(image, in: rect)
+            }
+            top -= h
+            ctx.progress(Double(i + 1) / Double(count + 1))
+        }
+        guard let image = canvas.makeImage() else { throw KError.failed(tr("Couldn't create the picture.")) }
+        let out = ctx.destination(for: input, ext: target.ext, suffix: count > 1 ? trf("%d pages", count) : nil)
+        try await ImageEngine.write(image, as: target, to: out, quality: ctx.settings.imageQuality, ctx: ctx)
+        return out
+    }
+
     // MARK: Text out
 
     /// The PDF's own text layer, or Live Text when the pages are scans.

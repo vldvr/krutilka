@@ -306,6 +306,7 @@ enum Catalog {
                 tool("compress", tr("Compress"), "arrow.down.right.and.arrow.up.left", hint: tr("Recompresses images inside")) { [try await PDFEngine.compress($0.input, ctx: $0)] }
             }
             tool("pdfmerge", tr("Merge"), "doc.on.doc", hint: tr("One PDF in name order"), batch: .all) { [try await PDFEngine.merge($0.inputs, ctx: $0)] }
+            tool("onejpg", tr("One JPG"), "rectangle.stack", hint: tr("All pages in one long picture")) { [try await PDFEngine.toSingleImage($0.input, as: .jpeg, ctx: $0)] }
             tool("split", tr("Split"), "rectangle.split.3x1", hint: tr("One file per page")) { [try await PDFEngine.split($0.input, ctx: $0)] }
             tool("searchable", tr("Searchable"), "doc.text.magnifyingglass", hint: tr("Adds a text layer to scans")) { [try await PDFEngine.makeSearchable($0.input, ctx: $0)] }
             tool("ocr", tr("Get text"), "text.viewfinder", hint: tr("Text to a file and the clipboard")) { ctx in
