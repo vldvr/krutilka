@@ -45,7 +45,10 @@ final class DragWatcher {
         DebugLog.write("flagsChanged \(flags.rawValue) files=\(files?.count ?? -1)")
         guard timer != nil else { return }
         if files == nil { tick() }
-        guard let urls = files, !urls.isEmpty, !flags.subtracting(lastFlags).isEmpty,
+        // Until the dragged files are known, keep the mouse-down baseline: a key pressed early
+        // must still count as "newly pressed" once the files show up.
+        guard let urls = files, !urls.isEmpty else { return }
+        guard !flags.subtracting(lastFlags).isEmpty,
               let kind = Prefs.shared.wheel(for: flags) else { lastFlags = flags; return }
         lastFlags = flags
         openedThisDrag = true
@@ -73,6 +76,9 @@ final class DragWatcher {
         let pb = NSPasteboard(name: .drag)
         if files == nil, pb.changeCount != baseline {
             let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            // The source may clear the pasteboard before writing to it; an empty read caught in
+            // between must not lock this drag out. Look again on the next tick.
+            if urls.isEmpty { return }
             files = urls
             DebugLog.write("drag detected, \(urls.count) files, flags=\(lastFlags.rawValue)")
             // Holding the convert key while starting the drag also counts.
@@ -81,9 +87,10 @@ final class DragWatcher {
                 onWheel?(kind, urls)
             }
         }
+        guard let urls = files, !urls.isEmpty else { return }
         let flags = KeyCombo(NSEvent.modifierFlags).flags
         defer { lastFlags = flags }
-        guard flags != lastFlags, let urls = files, !urls.isEmpty else { return }
+        guard flags != lastFlags else { return }
         // A newly pressed combination opens (or switches) its wheel. Releasing keys does nothing:
         // the wheel stays until the drop, so a tap is enough.
         guard !flags.subtracting(lastFlags).isEmpty, let kind = Prefs.shared.wheel(for: flags) else { return }
