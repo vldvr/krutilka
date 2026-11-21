@@ -15,12 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StatusItemController.shared.install()
 
         watcher.onWheel = { kind, files in
-            let wheel = WheelController.shared
-            if wheel.isOpen && !wheel.model.interactive {
-                wheel.switchTo(kind)
-            } else {
-                wheel.open(kind: kind, files: files, at: NSEvent.mouseLocation, interactive: false)
-            }
+            WheelController.shared.showForDrag(kind: kind, files: files, at: NSEvent.mouseLocation)
         }
         watcher.onDragEnded = { WheelController.shared.dragEnded() }
         watcher.start()

@@ -110,8 +110,10 @@ final class WheelController: NSObject, NSWindowDelegate {
     private var springTimer: Timer?
     private var springKind: WheelKind?
     private var closeWork: DispatchWorkItem?
+    private var dragEndWork: DispatchWorkItem?
+    private var prewarmWork: DispatchWorkItem?
 
-    var isOpen: Bool { model.isOpen }
+    var isOpen: Bool { model.isOpen && prewarmWork == nil && dragEndWork == nil }
     var panelForSnapshot: NSPanel { panel }
 
     private override init() {
@@ -139,19 +141,39 @@ final class WheelController: NSObject, NSWindowDelegate {
             model.isOpen = true
         }
         panel.displayIfNeeded()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.prewarmWork = nil
             self.model.isOpen = false
             self.panel.orderOut(nil)
             self.panel.alphaValue = 1
         }
+        prewarmWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     // MARK: Open / close
 
+    func showForDrag(kind: WheelKind, files: [URL], at point: NSPoint) {
+        if isOpen, !model.interactive {
+            switchTo(kind)
+        } else {
+            open(kind: kind, files: files, at: point, interactive: false)
+        }
+    }
+
     /// Opens centred on `point` (screen coordinates), kept inside the visible screen.
     func open(kind: WheelKind, files: [URL], at point: NSPoint, interactive: Bool) {
         guard !files.isEmpty else { return }
+        if let prewarmWork {
+            prewarmWork.cancel()
+            self.prewarmWork = nil
+            model.isOpen = false
+        }
+        dragEndWork?.cancel()
+        dragEndWork = nil
         closeWork?.cancel()
+        cancelSpring()
         model.geometry = WheelGeometry(scale: Prefs.shared.wheelSize.scale)
         model.interactive = interactive
         model.load(files: files, kind: kind)
@@ -192,6 +214,8 @@ final class WheelController: NSObject, NSWindowDelegate {
 
     func close() {
         guard model.isOpen else { return }
+        dragEndWork?.cancel()
+        dragEndWork = nil
         model.isOpen = false
         model.hit = .none
         cancelSpring()
@@ -203,11 +227,14 @@ final class WheelController: NSObject, NSWindowDelegate {
     /// The button came up somewhere. If it was over the wheel, AppKit delivers the drop a moment
     /// after this; give it time, then close if nothing landed.
     func dragEnded() {
-        guard model.isOpen, !model.interactive else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, self.model.isOpen, !self.model.interactive else { return }
+        guard isOpen, !model.interactive else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.dragEndWork = nil
             self.close()
         }
+        dragEndWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
     func windowDidResignKey(_ notification: Notification) {

@@ -236,6 +236,32 @@ check(prefs.wheel(for: [.shift, .command]) == nil, "a wheel opens only on its ex
 check(KeyCombo([.control, .option, .shift, .command]).glyphs == "⌃⌥⇧⌘", "key glyphs in Apple order")
 check(Recipe.defaults.count == 3 && Recipe.defaults[0].summary.hasPrefix("WEBP"), "default recipes")
 
+// MARK: Drag modifiers
+
+for (flags, wheel): (NSEvent.ModifierFlags, WheelKind) in [(.shift, .convert), (.option, .tools), (.control, .actions)] {
+    var modifiers = DragModifiers(initialFlags: [])
+    modifiers.observe(flags, wheelFor: prefs.wheel(for:))
+    modifiers.observe([], wheelFor: prefs.wheel(for:))
+    check(modifiers.takeWheel() == wheel, "\(wheel.rawValue) tap survives until file URLs arrive")
+    check(modifiers.takeWheel() == nil, "\(wheel.rawValue) tap is used once")
+}
+
+var modifiers = DragModifiers(initialFlags: .control)
+modifiers.observe(.control, wheelFor: prefs.wheel(for:))
+check(modifiers.takeWheel() == nil, "an already held actions key needs a fresh press")
+modifiers.observe([.control, .option], wheelFor: prefs.wheel(for:))
+modifiers.observe(.option, wheelFor: prefs.wheel(for:))
+check(modifiers.takeWheel() == nil, "releasing part of an unmatched chord does not open a wheel")
+modifiers.observe([], wheelFor: prefs.wheel(for:))
+modifiers.observe(.option, wheelFor: prefs.wheel(for:))
+modifiers.observe(.option, wheelFor: prefs.wheel(for:))
+check(modifiers.takeWheel() == .tools, "polling the same press preserves the requested wheel")
+modifiers.observe(.option, wheelFor: prefs.wheel(for:))
+check(modifiers.takeWheel() == nil, "polling a held key does not reopen its wheel")
+
+var heldConvert = DragModifiers(initialFlags: .shift, heldWheel: .convert)
+check(heldConvert.takeWheel() == .convert, "formats can open when their key is held at mouse down")
+
 // MARK: Checksums
 
 let abc = file("abc.txt", "abc")

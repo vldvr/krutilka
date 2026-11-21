@@ -1,110 +1,122 @@
 import AppKit
 
-/// Notices file drags in any app and modifier taps during them, without Accessibility permission:
-/// global *mouse* monitors are allowed, and the modifier state, the button state and the drag
-/// pasteboard can be read by anyone.
+/// A recognized key press can arrive before the drag pasteboard supplies the files.
+struct DragModifiers {
+    private var lastFlags: NSEvent.ModifierFlags
+    private var pendingWheel: WheelKind?
+
+    init(initialFlags: NSEvent.ModifierFlags, heldWheel: WheelKind? = nil) {
+        lastFlags = initialFlags
+        pendingWheel = heldWheel
+    }
+
+    mutating func observe(_ flags: NSEvent.ModifierFlags, wheelFor: (NSEvent.ModifierFlags) -> WheelKind?) {
+        defer { lastFlags = flags }
+        if !flags.subtracting(lastFlags).isEmpty, let wheel = wheelFor(flags) {
+            pendingWheel = wheel
+        }
+    }
+
+    mutating func takeWheel() -> WheelKind? {
+        defer { pendingWheel = nil }
+        return pendingWheel
+    }
+}
+
+/// Notices file drags and modifier taps without Accessibility permission. When global
+/// modifier events are unavailable, the timer samples the current modifier state.
 @MainActor
 final class DragWatcher {
     var onWheel: ((WheelKind, [URL]) -> Void)?
     var onDragEnded: (() -> Void)?
-    /// Set while our own windows start a drag (the shelf), so we don't react to ourselves.
-    var paused = false
 
     private var monitors: [Any] = []
     private var timer: Timer?
-    private var baseline = 0
+    private let pasteboard = NSPasteboard(name: .drag)
+    // Sample between drags. A delayed mouse-down callback can already see the new file URLs.
+    private var idleChangeCount = 0
     private var files: [URL]?
-    private var lastFlags: NSEvent.ModifierFlags = []
-    private var openedThisDrag = false
+    private var modifiers: DragModifiers?
 
     func start() {
-        let down = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
-            MainActor.assumeIsolated { self?.mouseDown() }
+        idleChangeCount = pasteboard.changeCount
+        let mouseEvents: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        let mouse = NSEvent.addGlobalMonitorForEvents(matching: mouseEvents) { [weak self] event in
+            MainActor.assumeIsolated { self?.mouseEvent(event) }
         }
-        let dragged = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
-        }
-        // Our own panels (shelf, onboarding) are local, so watch those too.
-        let localDown = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-            MainActor.assumeIsolated { self?.mouseDown() }
+        let localMouse = NSEvent.addLocalMonitorForEvents(matching: mouseEvents) { [weak self] event in
+            MainActor.assumeIsolated { self?.mouseEvent(event) }
             return event
         }
-        // Catches modifier taps shorter than one poll. Delivered when macOS allows it; polling covers the rest.
         let flags = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            MainActor.assumeIsolated { self?.flagsChanged(KeyCombo(event.modifierFlags).flags) }
+            MainActor.assumeIsolated { self?.update(flags: event.modifierFlags) }
         }
         let localFlags = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-            MainActor.assumeIsolated { self?.flagsChanged(KeyCombo(event.modifierFlags).flags) }
+            MainActor.assumeIsolated { self?.update(flags: event.modifierFlags) }
             return event
         }
-        monitors = [down, dragged, localDown, flags, localFlags].compactMap { $0 }
-        DebugLog.write("watcher started, flags monitor: \(flags != nil)")
+        monitors = [mouse, localMouse, flags, localFlags].compactMap { $0 }
+        DebugLog.write("watcher started, mouse monitor: \(mouse != nil), flags monitor: \(flags != nil)")
     }
 
-    private func flagsChanged(_ flags: NSEvent.ModifierFlags) {
-        DebugLog.write("flagsChanged \(flags.rawValue) files=\(files?.count ?? -1)")
-        guard timer != nil else { return }
-        if files == nil { tick() }
-        // Until the dragged files are known, keep the mouse-down baseline: a key pressed early
-        // must still count as "newly pressed" once the files show up.
-        guard let urls = files, !urls.isEmpty else { return }
-        guard !flags.subtracting(lastFlags).isEmpty,
-              let kind = Prefs.shared.wheel(for: flags) else { lastFlags = flags; return }
-        lastFlags = flags
-        openedThisDrag = true
-        onWheel?(kind, urls)
-    }
-
-    private func mouseDown() {
-        baseline = NSPasteboard(name: .drag).changeCount
-        DebugLog.write("mouseDown baseline=\(baseline)")
-        files = nil
-        openedThisDrag = false
-        lastFlags = KeyCombo(NSEvent.modifierFlags).flags
-        timer?.invalidate()
-        // 60 Hz only while the button is held; nothing runs between drags.
-        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+    private func mouseEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            if modifiers != nil { finish() }
+            let flags = KeyCombo(event.modifierFlags).flags
+            let prefs = Prefs.shared
+            let heldWheel: WheelKind? = prefs.openOnShiftHeld && prefs.wheel(for: flags) == .convert ? .convert : nil
+            begin(DragModifiers(initialFlags: flags, heldWheel: heldWheel))
+        case .leftMouseDragged:
+            guard NSEvent.pressedMouseButtons & 1 == 1 else { return }
+            if modifiers == nil {
+                // A native drag may already own the pasteboard when we first see it.
+                begin(DragModifiers(initialFlags: []))
+            }
+            update(flags: NSEvent.modifierFlags)
+        case .leftMouseUp:
+            finish()
+        default:
+            break
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
     }
 
-    private func tick() {
+    private func begin(_ modifiers: DragModifiers) {
+        self.modifiers = modifiers
+        DebugLog.write("watching mouse press, pasteboard baseline=\(idleChangeCount)")
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.update(flags: NSEvent.modifierFlags) }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func update(flags: NSEvent.ModifierFlags) {
+        guard modifiers != nil else { return }
         guard NSEvent.pressedMouseButtons & 1 == 1 else { finish(); return }
-        guard !paused else { return }
-        let pb = NSPasteboard(name: .drag)
-        if files == nil, pb.changeCount != baseline {
-            let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-            // The source may clear the pasteboard before writing to it; an empty read caught in
-            // between must not lock this drag out. Look again on the next tick.
-            if urls.isEmpty { return }
-            files = urls
-            DebugLog.write("drag detected, \(urls.count) files, flags=\(lastFlags.rawValue)")
-            // Holding the convert key while starting the drag also counts.
-            if !urls.isEmpty, Prefs.shared.openOnShiftHeld, let kind = Prefs.shared.wheel(for: lastFlags), kind == .convert {
-                openedThisDrag = true
-                onWheel?(kind, urls)
+        modifiers?.observe(KeyCombo(flags).flags, wheelFor: Prefs.shared.wheel(for:))
+
+        if files == nil, pasteboard.changeCount != idleChangeCount {
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                                              options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            // The source can clear the pasteboard before it publishes its URLs.
+            if !urls.isEmpty {
+                files = urls
+                DebugLog.write("drag detected, \(urls.count) files")
             }
         }
-        guard let urls = files, !urls.isEmpty else { return }
-        let flags = KeyCombo(NSEvent.modifierFlags).flags
-        defer { lastFlags = flags }
-        guard flags != lastFlags else { return }
-        // A newly pressed combination opens (or switches) its wheel. Releasing keys does nothing:
-        // the wheel stays until the drop, so a tap is enough.
-        guard !flags.subtracting(lastFlags).isEmpty, let kind = Prefs.shared.wheel(for: flags) else { return }
-        openedThisDrag = true
-        DebugLog.write("open wheel \(kind.rawValue) (poll)")
-        onWheel?(kind, urls)
+        guard let files, let kind = modifiers?.takeWheel() else { return }
+        DebugLog.write("open wheel \(kind.rawValue)")
+        onWheel?(kind, files)
     }
 
     private func finish() {
-        DebugLog.write("mouse up, files=\(files?.count ?? -1) opened=\(openedThisDrag)")
+        idleChangeCount = pasteboard.changeCount
         timer?.invalidate()
         timer = nil
-        if files != nil || openedThisDrag { onDragEnded?() }
+        modifiers = nil
+        let hadFiles = files != nil
         files = nil
-        openedThisDrag = false
+        if hadFiles { onDragEnded?() }
     }
 }
